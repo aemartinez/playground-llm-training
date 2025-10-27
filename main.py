@@ -16,40 +16,75 @@ install_package("torchaudio")
 install_package("hf_transfer")
 install_package("accelerate>=0.26.0")
 install_package("huggingface_hub")
+install_package("ipywidgets")
 # %%
-from datasets import load_dataset
+from datasets import load_dataset, Dataset
 from transformers import GPT2TokenizerFast
 tok = GPT2TokenizerFast.from_pretrained("gpt2")
-# %%
-ds = load_dataset("wikitext", "wikitext-103-raw-v1")
-train_ds = ds['train']
-
-# %% 
-seed = 42
-train_ds = train_ds.shuffle(seed=seed)
-# %%
-cleaned_train_ds = train_ds.filter(lambda x: x["text"].strip() != "", batched=False)
-
-# %%
-print(f"Original train size: {len(train_ds)}")
-print(f"Filtered train size: {len(cleaned_train_ds)}")
-print(f"Kept: {len(cleaned_train_ds) / len(train_ds) * 100:.1f}%")
-
-# %%
-def tokenize(batch):
-    return tok(batch["text"], truncation=False)
-
-# %%
-tokenized = cleaned_train_ds.map(tokenize, batched=True, remove_columns=cleaned_train_ds.column_names)
-# %%
-example = tokenized[0]
-print(example)
-
-print(tok.decode(example["input_ids"]))
-# %%
 # ensure pad token
 if tok.pad_token is None:
     tok.pad_token = tok.eos_token
+# %% 
+def stream_sample(dataset_name, config_name=None, split="train", n=1_000_000, seed=42):
+    if config_name:
+        ds = load_dataset(dataset_name, config_name, split=split, streaming=True)
+    else:
+        ds = load_dataset(dataset_name, split=split, streaming=True)
+    sampled = []
+    for i, ex in enumerate(ds.shuffle(seed=seed)):
+        sampled.append(ex)  
+        if i >= n:
+            break
+    return sampled
+
+# %%
+sources = {
+    "arxiv":    ("timaeus/pile-arxiv", 40_000),
+    "wikitext": ("wikitext", "wikitext-103-raw-v1", 20_000),  # Added config name
+    "books3":    ("amongglue/books3-subset-raw", 100_000),  # Books3 subset
+    "fineweb":  ("HuggingFaceFW/fineweb-edu", 200_000),
+    "openweb":  ("dylanebert/openwebtext", 100_000),  # Streaming-compatible OpenWebText
+}
+
+from tqdm.notebook import tqdm
+
+samples = {}
+for name, source_info in tqdm(sources.items(), desc="Sampling datasets"):
+    if len(source_info) == 3:  # (dataset_name, config_name, n)
+        ds_name, config_name, n = source_info
+        samples[name] = stream_sample(ds_name, config_name=config_name, n=n)
+    else:  # (dataset_name, n)
+        ds_name, n = source_info
+        samples[name] = stream_sample(ds_name, n=n)
+
+# %%
+for name, sample in samples.items():
+    samples[name] = samples[name].filter(lambda x: x["text"].strip() != "", batched=True, batch_size=1000)
+# %% 
+def texts_to_tokens(samples):
+    all_examples = []
+    for lst in samples.values():
+        all_examples.extend(lst)
+    
+    ds = Dataset.from_list(all_examples)
+    
+    def tokenize_batch(batch):
+        return tok(batch["text"], truncation=False, return_tensors=None)
+    
+    tokenized_ds = ds.map(tokenize_batch, batched=True, batch_size=1000, remove_columns=ds.column_names)
+    
+    all_tokens = []
+    for example in tqdm(tokenized_ds, desc="Collecting tokens"):
+        all_tokens.extend(example["input_ids"])
+    
+    return all_tokens
+
+# %% 
+tokenized = texts_to_tokens(samples)
+print(f"Collected {len(tokenized):,} tokens")
+
+# %% 
+seed = 42
 
 # shuffle and split BEFORE grouping to ensure disjoint train/eval
 tokenized_shuf = tokenized.shuffle(seed=seed)
@@ -57,7 +92,7 @@ split = tokenized_shuf.train_test_split(test_size=0.02, seed=seed)  # 2% eval
 tokenized_train = split["train"]
 tokenized_eval  = split["test"]
 
-block_size = 1024
+block_size = 2048
 
 def group_texts(examples):
     all_ids = sum(examples["input_ids"], [])
@@ -120,13 +155,13 @@ login(token=os.environ["HF_TOKEN"])
 import math
 
 num_train_samples = len(train_ds)
-per_device = 8   # choose based on GPU memory — A100-40GB can often do 8 for 100M model at 1024
+per_device = 8  
 grad_accum = 8
 effective_batch = per_device * grad_accum
 
 # estimate steps per epoch and total steps
 steps_per_epoch = math.ceil(num_train_samples / per_device / grad_accum)
-num_train_epochs = 3
+num_train_epochs = 5
 total_training_steps = steps_per_epoch * num_train_epochs
 
 # warmup: use fraction (e.g. 3% of total steps) but at least 100
