@@ -61,7 +61,7 @@ for name, source_info in tqdm(sources.items(), desc="Sampling datasets"):
 for name, sample in samples.items():
     # Convert list to dataset first, then filter
     ds = Dataset.from_list(samples[name])
-    samples[name] = ds.filter(lambda x: x["text"].strip() != "", batched=True, batch_size=1000)
+    samples[name] = ds.filter(lambda batch: [text.strip() != "" for text in batch["text"]], batched=True, batch_size=1000)
 # %% 
 def texts_to_tokens(samples):
     all_examples = []
