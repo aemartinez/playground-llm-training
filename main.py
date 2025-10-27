@@ -38,12 +38,22 @@ def stream_sample(dataset_name, config_name=None, split="train", n=1_000_000, se
     return sampled
 
 # %%
+# sources = {
+#     "arxiv":    ("timaeus/pile-arxiv", 40_000),
+#     "wikitext": ("wikitext", "wikitext-103-raw-v1", 20_000),  # Added config name
+#     "books3":    ("amongglue/books3-subset-raw", 100_000),  # Books3 subset
+#     "fineweb":  ("HuggingFaceFW/fineweb-edu", 200_000),
+#     "openweb":  ("dylanebert/openwebtext", 100_000),  # Streaming-compatible OpenWebText
+# }
+
+# %% 
+# Dry run with little data
 sources = {
-    "arxiv":    ("timaeus/pile-arxiv", 40_000),
-    "wikitext": ("wikitext", "wikitext-103-raw-v1", 20_000),  # Added config name
-    "books3":    ("amongglue/books3-subset-raw", 100_000),  # Books3 subset
-    "fineweb":  ("HuggingFaceFW/fineweb-edu", 200_000),
-    "openweb":  ("dylanebert/openwebtext", 100_000),  # Streaming-compatible OpenWebText
+    "arxiv":    ("timaeus/pile-arxiv", 1000),
+    "wikitext": ("wikitext", "wikitext-103-raw-v1", 1000),  # Added config name
+    "books3":    ("amongglue/books3-subset-raw", 1000),  # Books3 subset
+    "fineweb":  ("HuggingFaceFW/fineweb-edu", 1000),
+    "openweb":  ("dylanebert/openwebtext", 1000),  # Streaming-compatible OpenWebText
 }
 
 from tqdm.notebook import tqdm
@@ -76,21 +86,18 @@ def texts_to_tokens(samples):
     
     tokenized_ds = ds.map(tokenize_batch, batched=True, batch_size=1000, remove_columns=ds.column_names)
     
-    all_tokens = []
-    for example in tqdm(tokenized_ds, desc="Collecting tokens"):
-        all_tokens.extend(example["input_ids"])
-    
-    return all_tokens
+    # Instead of converting to list, work directly with the dataset
+    return tokenized_ds
 
 # %% 
-tokenized = texts_to_tokens(samples)
-print(f"Collected {len(tokenized):,} tokens")
+tokenized_ds = texts_to_tokens(samples)
+print(f"Collected {len(tokenized_ds):,} examples")
 
 # %% 
 seed = 42
 
 # shuffle and split BEFORE grouping to ensure disjoint train/eval
-tokenized_shuf = tokenized.shuffle(seed=seed)
+tokenized_shuf = tokenized_ds.shuffle(seed=seed)
 split = tokenized_shuf.train_test_split(test_size=0.02, seed=seed)  # 2% eval
 tokenized_train = split["train"]
 tokenized_eval  = split["test"]
