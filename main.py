@@ -3,6 +3,9 @@ import os
 import subprocess
 import sys
 
+# Suppress tokenizers parallelism warning
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 # %%
 def install_package(package):
     subprocess.check_call([sys.executable, "-m", "pip", "install", package])
@@ -20,10 +23,39 @@ install_package("ipywidgets")
 # %%
 from datasets import load_dataset, Dataset
 from transformers import GPT2TokenizerFast
+import pickle
+import hashlib
+import os
+
 tok = GPT2TokenizerFast.from_pretrained("gpt2")
 # ensure pad token
 if tok.pad_token is None:
     tok.pad_token = tok.eos_token
+# set model max length to match our training context
+tok.model_max_length = 2048
+
+def get_cache_path(sources):
+    """Generate a cache file path based on the sources configuration"""
+    # Create a hash of the sources to ensure cache validity
+    sources_str = str(sorted(sources.items()))
+    cache_hash = hashlib.md5(sources_str.encode()).hexdigest()[:8]
+    return f"cache/tokenized_data_{cache_hash}.pkl"
+
+def load_cached_tokenized_data(cache_path):
+    """Load tokenized data from cache if it exists"""
+    if os.path.exists(cache_path):
+        print(f"Loading cached tokenized data from {cache_path}")
+        with open(cache_path, 'rb') as f:
+            return pickle.load(f)
+    return None
+
+def save_tokenized_data(tokenized_ds, cache_path):
+    """Save tokenized data to cache"""
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    print(f"Saving tokenized data to {cache_path}")
+    with open(cache_path, 'wb') as f:
+        pickle.dump(tokenized_ds, f)
+
 # %% 
 def stream_sample(dataset_name, config_name=None, split="train", n=1_000_000, seed=42):
     if config_name:
@@ -38,60 +70,72 @@ def stream_sample(dataset_name, config_name=None, split="train", n=1_000_000, se
     return sampled
 
 # %%
-# sources = {
-#     "arxiv":    ("timaeus/pile-arxiv", 40_000),
-#     "wikitext": ("wikitext", "wikitext-103-raw-v1", 20_000),  # Added config name
-#     "books3":    ("amongglue/books3-subset-raw", 100_000),  # Books3 subset
-#     "fineweb":  ("HuggingFaceFW/fineweb-edu", 200_000),
-#     "openweb":  ("dylanebert/openwebtext", 100_000),  # Streaming-compatible OpenWebText
-# }
-
-# %% 
-# Dry run with little data
 sources = {
-    "arxiv":    ("timaeus/pile-arxiv", 1000),
-    "wikitext": ("wikitext", "wikitext-103-raw-v1", 1000),  # Added config name
-    "books3":    ("amongglue/books3-subset-raw", 1000),  # Books3 subset
-    "fineweb":  ("HuggingFaceFW/fineweb-edu", 1000),
-    "openweb":  ("dylanebert/openwebtext", 1000),  # Streaming-compatible OpenWebText
+    "arxiv":    ("timaeus/pile-arxiv", 40_000),
+    "wikitext": ("wikitext", "wikitext-103-raw-v1", 20_000),  # Added config name
+    "books3":    ("amongglue/books3-subset-raw", 100_000),  # Books3 subset
+    "fineweb":  ("HuggingFaceFW/fineweb-edu", 200_000),
+    "openweb":  ("dylanebert/openwebtext", 100_000),  # Streaming-compatible OpenWebText
 }
 
-from tqdm.notebook import tqdm
-
-samples = {}
-for name, source_info in tqdm(sources.items(), desc="Sampling datasets"):
-    if len(source_info) == 3:  # (dataset_name, config_name, n)
-        ds_name, config_name, n = source_info
-        samples[name] = stream_sample(ds_name, config_name=config_name, n=n)
-    else:  # (dataset_name, n)
-        ds_name, n = source_info
-        samples[name] = stream_sample(ds_name, n=n)
-
-# %%
-for name, sample in samples.items():
-    # Convert list to dataset first, then filter
-    ds = Dataset.from_list(samples[name])
-    samples[name] = ds.filter(lambda batch: [text.strip() != "" for text in batch["text"]], batched=True, batch_size=1000)
 # %% 
-def texts_to_tokens(samples):
-    all_examples = []
-    for dataset in samples.values():
-        # Convert dataset to list of examples
-        all_examples.extend([example for example in dataset])
-    
-    ds = Dataset.from_list(all_examples)
-    
-    def tokenize_batch(batch):
-        return tok(batch["text"], truncation=False, return_tensors=None)
-    
-    tokenized_ds = ds.map(tokenize_batch, batched=True, batch_size=1000, remove_columns=ds.column_names)
-    
-    # Instead of converting to list, work directly with the dataset
-    return tokenized_ds
+# # Dry run with little data
+# sources = {
+#     "arxiv":    ("timaeus/pile-arxiv", 1000),
+#     "wikitext": ("wikitext", "wikitext-103-raw-v1", 1000),  # Added config name
+#     "books3":    ("amongglue/books3-subset-raw", 1000),  # Books3 subset
+#     "fineweb":  ("HuggingFaceFW/fineweb-edu", 1000),
+#     "openweb":  ("dylanebert/openwebtext", 1000),  # Streaming-compatible OpenWebText
+# }
 
-# %% 
-tokenized_ds = texts_to_tokens(samples)
-print(f"Collected {len(tokenized_ds):,} examples")
+# Check for cached tokenized data first
+cache_path = get_cache_path(sources)
+tokenized_ds = load_cached_tokenized_data(cache_path)
+
+if tokenized_ds is None:
+    print("No cached data found. Sampling and tokenizing datasets...")
+    
+    from tqdm.notebook import tqdm
+
+    samples = {}
+    for name, source_info in tqdm(sources.items(), desc="Sampling datasets"):
+        if len(source_info) == 3:  # (dataset_name, config_name, n)
+            ds_name, config_name, n = source_info
+            samples[name] = stream_sample(ds_name, config_name=config_name, n=n)
+        else:  # (dataset_name, n)
+            ds_name, n = source_info
+            samples[name] = stream_sample(ds_name, n=n)
+
+    # %%
+    for name, sample in samples.items():
+        # Convert list to dataset first, then filter
+        ds = Dataset.from_list(samples[name])
+        samples[name] = ds.filter(lambda batch: [text.strip() != "" for text in batch["text"]], batched=True, batch_size=1000)
+    
+    # %%
+    def texts_to_tokens(samples):
+        all_examples = []
+        for dataset in samples.values():
+            # Convert dataset to list of examples
+            all_examples.extend([example for example in dataset])
+        
+        ds = Dataset.from_list(all_examples)
+        
+        def tokenize_batch(batch):
+            return tok(batch["text"], truncation=False, return_tensors=None)
+        
+        tokenized_ds = ds.map(tokenize_batch, batched=True, batch_size=1000, remove_columns=ds.column_names)
+        
+        # Instead of converting to list, work directly with the dataset
+        return tokenized_ds
+
+    print("Tokenizing datasets...")
+    tokenized_ds = texts_to_tokens(samples)
+    print(f"Collected {len(tokenized_ds):,} examples")
+    save_tokenized_data(tokenized_ds, cache_path)
+else:
+    print(f"Loaded cached tokenized data with {len(tokenized_ds):,} examples")
+
 
 # %% 
 seed = 42
@@ -147,6 +191,7 @@ cfg = GPT2Config(
 model = GPT2LMHeadModel(cfg)
 
 # %%
+import torch
 model.gradient_checkpointing_enable()   # saves memory at cost of compute
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model.to(device)
@@ -155,7 +200,6 @@ model.to(device)
 train_ds = lm_dataset
 
 from transformers import TrainingArguments
-import torch
 
 # %%
 from huggingface_hub import login
