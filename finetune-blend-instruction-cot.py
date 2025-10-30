@@ -1,4 +1,5 @@
 import os
+import re
 from pathlib import Path
 from typing import Dict, Tuple
 import random
@@ -68,6 +69,109 @@ tok = GPT2TokenizerFast.from_pretrained("gpt2")
 if tok.pad_token is None:
     tok.pad_token = tok.eos_token
 tok.model_max_length = MAX_SEQ_LENGTH
+
+# -----------------------------
+# CoT normalization utilities
+# -----------------------------
+# Patterns to detect likely chain-of-thought and final answer markers
+COT_MARKERS = [
+    (re.compile(r"<\|begin_of_thought\|>(.*?)<\|end_of_thought\|>", re.S), "cot_marker"),
+    (re.compile(r"<thinking>(.*?)</thinking>", re.S|re.I), "xml_thinking"),
+    (re.compile(r"<step_by_step>(.*?)</step_by_step>", re.S|re.I), "xml_step"),
+]
+
+# Pattern to capture "Final answer" like tokens or LaTeX/boxed answer
+FINAL_PATTERNS = [
+    re.compile(r"Final answer[:\s]*\\?\\?boxed\{?([^\}\n]+)\}?", re.I),
+    re.compile(r"####\s*([0-9A-Za-z\-\+\*/\s\(\)]+)$", re.M),   # gsm8k style
+    re.compile(r"Final[:\s]*([^\n]+)$", re.I|re.M),
+    re.compile(r"Answer[:\s]*([^\n]+)$", re.I|re.M),
+    re.compile(r"\\<<(.+?)\\>>"),  # unusual math marker
+]
+
+# fallback heuristics
+SPLIT_TERMS = [
+    r"\nFinal answer[:\s]*", r"\nAnswer[:\s]*", r"\n####\s*", r"\n<\|end_of_thought\|>"
+]
+SPLIT_RE = re.compile("|".join(SPLIT_TERMS), re.I)
+
+def extract_chain_and_answer(raw: str) -> Tuple[str, str]:
+    txt = raw.strip()
+
+    # 1) Try explicit markers (<|begin_of_thought|> ... <|end_of_thought|>)
+    for pat, _name in COT_MARKERS:
+        m = pat.search(txt)
+        if m:
+            cot = m.group(1).strip()
+            final = ""
+            # check inside for "Final answer" / boxed / #### etc.
+            for fp in FINAL_PATTERNS:
+                mm = fp.search(cot)
+                if mm:
+                    final = mm.group(1).strip()
+                    cot = fp.sub("", cot).strip()
+                    break
+            # also check text after match
+            after = txt[m.end():].strip()
+            if not final:
+                for fp in FINAL_PATTERNS:
+                    mm = fp.search(after)
+                    if mm:
+                        final = mm.group(1).strip()
+                        break
+            return cot, final
+
+    # 2) Try XML-like <thinking>...</thinking>
+    m = re.search(r"<thinking>(.*?)</thinking>", txt, re.S|re.I)
+    if m:
+        body = m.group(1).strip()
+        parts = SPLIT_RE.split(body, maxsplit=1)
+        if len(parts) > 1:
+            chain = parts[0].strip()
+            final = parts[1].strip()
+            return chain, final
+        for fp in FINAL_PATTERNS:
+            mm = fp.search(body)
+            if mm:
+                final = mm.group(1).strip()
+                chain = fp.sub("", body).strip()
+                return chain, final
+        return body, ""
+
+    # 3) GSM-style numeric tags or '####' (common in math datasets)
+    m = re.search(r"\n####\s*([^\n]+)", txt)
+    if m:
+        final = m.group(1).strip()
+        chain = txt[:m.start()].strip()
+        return chain, final
+
+    # 4) Literal "Final answer:" line
+    m = re.search(r"Final answer[:\s]*(.+)$", txt, re.I|re.M)
+    if m:
+        final = m.group(1).strip()
+        chain = txt[:m.start()].strip()
+        return chain, final
+
+    # 5) Heuristic: last short paragraph as final
+    paras = [p.strip() for p in re.split(r"\n\s*\n", txt) if p.strip()]
+    if len(paras) >= 2:
+        last = paras[-1]
+        if len(last.split()) <= 6 or re.match(r"^[\d\-\+\*/\s\(\)]+$", last):
+            chain = "\n\n".join(paras[:-1]).strip()
+            final = last
+            return chain, final
+
+    return txt, ""
+
+def canonicalize_response_text(raw_response: str) -> str:
+    chain, final = extract_chain_and_answer(raw_response)
+    lead = "Let's think step by step."
+    body = chain.strip()
+    if final:
+        final_line = f"\n\nFinal answer: {final.strip()}"
+    else:
+        final_line = ""
+    return f"{lead}\n\n{body}{final_line}"
 
 # -----------------------------
 # helpers: normalization functions
@@ -296,10 +400,8 @@ def build_merged_dataset(target_counts: Dict[str,int], out_jsonl: Path):
 def format_prompt_response(example):
     prompt = example["prompt"].strip()
     response = example["response"].strip()
-
-    # If response already contains "Let's think" or "Step", keep it.
-    # Standard wrapper encourages CoT style when present.
-    full = f"User: {prompt}\nAssistant: {response}"
+    normalized = canonicalize_response_text(response)
+    full = f"User: {prompt}\nAssistant: {normalized}"
     return {"text": full}
 
 # -----------------------------
