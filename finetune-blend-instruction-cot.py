@@ -3,6 +3,22 @@ from pathlib import Path
 from typing import Dict, Tuple
 import random
 import math
+import subprocess
+import sys
+# %%
+def install_package(package):
+    subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+
+# %%
+install_package("datasets")
+install_package("transformers[torch]")
+install_package("torch")
+install_package("torchvision")
+install_package("torchaudio")
+install_package("hf_transfer")
+install_package("accelerate>=0.26.0")
+install_package("huggingface_hub")
+install_package("ipywidgets")
 
 from datasets import load_dataset, Dataset, concatenate_datasets, DatasetDict
 from transformers import GPT2TokenizerFast
@@ -34,8 +50,8 @@ TARGET_COUNTS: Dict[str, int] = {
     "tatsu-lab/alpaca": 1000,
     "databricks/databricks-dolly-15k": 1000,
     "teknium/OpenHermes-2.5": 1000,
-    "thoughtsource/thoughtsource": 1000,
-    "open-r1/OpenThoughts-114k": 1000,
+    "causal-lm/thought_source": 1000,
+    "open-thoughts/OpenThoughts-114k": 1000,
     "gsm8k": 1000,
     "isaiahbjork/chain-of-thought": 1000,
 }
@@ -139,6 +155,7 @@ NORMALIZERS = {
     "teknium/OpenHermes-2.5": normalize_openhermes,
     "thoughtsource/thoughtsource": normalize_thoughtsource,
     "open-r1/OpenThoughts-114k": normalize_thoughtsource,
+    "open-thoughts/OpenThoughts-114k": normalize_thoughtsource,
     "gsm8k": normalize_gsm8k,
     "isaiahbjork/chain-of-thought": normalize_generic,
 }
@@ -150,15 +167,27 @@ def fetch_and_normalize(dataset_id: str, target_count: int, seed=RANDOM_SEED):
     print(f"\n=== Loading {dataset_id} (target {target_count}) ===")
     normalizer = NORMALIZERS.get(dataset_id, normalize_generic)
 
+    # Some datasets require an explicit config
+    config_overrides = {
+        "gsm8k": "main",  # available configs: 'main', 'socratic'
+    }
+    cfg = config_overrides.get(dataset_id)
+
     # Prefer streaming sample to avoid loading entire dataset
     recs = None
     try:
         # Try explicit train split in streaming mode
-        ds_stream = load_dataset(dataset_id, split="train", streaming=True)
+        if cfg:
+            ds_stream = load_dataset(dataset_id, cfg, split="train", streaming=True)
+        else:
+            ds_stream = load_dataset(dataset_id, split="train", streaming=True)
     except Exception:
         try:
             # Try without split, then pick a preferred split
-            tmp = load_dataset(dataset_id, streaming=True)
+            if cfg:
+                tmp = load_dataset(dataset_id, cfg, streaming=True)
+            else:
+                tmp = load_dataset(dataset_id, streaming=True)
             if isinstance(tmp, dict):
                 for pref in ("train", "validation", "test"):
                     if pref in tmp:
@@ -183,10 +212,16 @@ def fetch_and_normalize(dataset_id: str, target_count: int, seed=RANDOM_SEED):
         # Fallback: load in-memory and then sample deterministically
         ds = None
         try:
-            ds = load_dataset(dataset_id, split="train")
+            if cfg:
+                ds = load_dataset(dataset_id, cfg, split="train")
+            else:
+                ds = load_dataset(dataset_id, split="train")
         except Exception:
             try:
-                ds = load_dataset(dataset_id)
+                if cfg:
+                    ds = load_dataset(dataset_id, cfg)
+                else:
+                    ds = load_dataset(dataset_id)
                 if isinstance(ds, dict):
                     for pref in ("train","validation","test"):
                         if pref in ds:
@@ -221,7 +256,7 @@ def fetch_and_normalize(dataset_id: str, target_count: int, seed=RANDOM_SEED):
         # quick length check (characters) — tokens will be handled later
         if len(p) + len(a) > 20000:  # sanity upper bound
             continue
-        filtered.append({"prompt": p, "response": a})
+        filtered.append({"prompt": p, "response": a, "dataset": dataset_id})
     print(f" - normalized & filtered -> {len(filtered)} examples")
     return filtered
 
@@ -276,8 +311,17 @@ def tokenize_and_group(dataset: Dataset, tokenizer: GPT2TokenizerFast, max_lengt
     def to_text(ex):
         return {"text": format_prompt_response(ex)["text"]}
 
-    # map to text column
-    text_ds = dataset.map(lambda ex: {"text": [format_prompt_response(e)["text"] for e in ex]}, batched=True, remove_columns=dataset.column_names)
+    # map to text column (batched for efficiency)
+    def to_text_batch(batch):
+        prompts = batch.get("prompt", [])
+        responses = batch.get("response", [])
+        texts = [
+            f"User: {str(p).strip()}\nAssistant: {str(r).strip()}"
+            for p, r in zip(prompts, responses)
+        ]
+        return {"text": texts}
+
+    text_ds = dataset.map(to_text_batch, batched=True, remove_columns=dataset.column_names)
     # tokenization function
     def tok_batch(batch):
         out = tokenizer(batch["text"], truncation=True, max_length=max_length, padding=False)
