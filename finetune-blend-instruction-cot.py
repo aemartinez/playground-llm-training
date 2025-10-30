@@ -78,11 +78,14 @@ COT_MARKERS = [
     (re.compile(r"<\|begin_of_thought\|>(.*?)<\|end_of_thought\|>", re.S), "cot_marker"),
     (re.compile(r"<thinking>(.*?)</thinking>", re.S|re.I), "xml_thinking"),
     (re.compile(r"<step_by_step>(.*?)</step_by_step>", re.S|re.I), "xml_step"),
+    (re.compile(r"<\|begin_of_solution\|>(.*?)<\|end_of_solution\|>", re.S), "solution_marker"),
+    (re.compile(r"<solution>(.*?)</solution>", re.S|re.I), "xml_solution"),
 ]
 
 # Pattern to capture "Final answer" like tokens or LaTeX/boxed answer
 FINAL_PATTERNS = [
-    re.compile(r"Final answer[:\s]*\\?\\?boxed\{?([^\}\n]+)\}?", re.I),
+    # Match LaTeX boxed answers with or without preceding label
+    re.compile(r"\\boxed\{?([^\}\n]+)\}?", re.I),
     re.compile(r"####\s*([0-9A-Za-z\-\+\*/\s\(\)]+)$", re.M),   # gsm8k style
     re.compile(r"Final[:\s]*([^\n]+)$", re.I|re.M),
     re.compile(r"Answer[:\s]*([^\n]+)$", re.I|re.M),
@@ -91,7 +94,7 @@ FINAL_PATTERNS = [
 
 # fallback heuristics
 SPLIT_TERMS = [
-    r"\nFinal answer[:\s]*", r"\nAnswer[:\s]*", r"\n####\s*", r"\n<\|end_of_thought\|>"
+    r"\nFinal answer[:\s]*", r"\nAnswer[:\s]*", r"\n####\s*", r"\n<\|end_of_thought\|>", r"\n<\|end_of_solution\|>"
 ]
 SPLIT_RE = re.compile("|".join(SPLIT_TERMS), re.I)
 
@@ -201,14 +204,43 @@ def normalize_dolly(ds):
     return out
 
 def normalize_openhermes(ds):
-    # OpenHermes variants vary; try common fields
+    # OpenHermes variants vary; handle chat-style and flat fields
     out = []
     for rec in ds:
-        instr = rec.get("instruction") or rec.get("user_query") or rec.get("input","")
-        resp = rec.get("output") or rec.get("response") or rec.get("assistant","")
-        if not instr and "question" in rec:
-            instr = rec["question"]
-        out.append({"prompt": str(instr).strip(), "response": str(resp).strip()})
+        prompt = ""
+        response = ""
+
+        # 1) Chat-style ShareGPT format: conversations: [{from: "human"|"gpt", value: "..."}, ...]
+        conv = rec.get("conversations")
+        if isinstance(conv, (list, tuple)) and conv:
+            try:
+                # find first human/user turn and its next assistant turn
+                for i, m in enumerate(conv):
+                    role = (m.get("from") or m.get("role") or "").lower()
+                    content = m.get("value") or m.get("content") or ""
+                    if role in ("human", "user") and content:
+                        prompt = str(content).strip()
+                        # find next assistant reply
+                        for j in range(i+1, len(conv)):
+                            mj = conv[j]
+                            rj = (mj.get("from") or mj.get("role") or "").lower()
+                            cj = mj.get("value") or mj.get("content") or ""
+                            if rj in ("gpt", "assistant") and cj:
+                                response = str(cj).strip()
+                                break
+                        break
+            except Exception:
+                pass
+
+        # 2) Flat fields fallback
+        if not prompt:
+            prompt = rec.get("instruction") or rec.get("user_query") or rec.get("input") or rec.get("question") or rec.get("prompt") or ""
+        if not response:
+            response = rec.get("output") or rec.get("response") or rec.get("assistant") or rec.get("completion") or ""
+
+        if not prompt or not response:
+            continue
+        out.append({"prompt": str(prompt).strip(), "response": str(response).strip()})
     return out
 
 def normalize_thoughtsource(ds):
@@ -252,6 +284,68 @@ def normalize_generic(ds):
         out.append({"prompt": str(q).strip(), "response": str(a).strip()})
     return out
 
+def normalize_open_thoughts(ds):
+    # Handle OpenThoughts schema variants; prefer chat-style messages
+    out = []
+    for rec in ds:
+        prompt = ""
+        response = ""
+
+        msgs = rec.get("messages")
+        if isinstance(msgs, (list, tuple)):
+            try:
+                # support common roles: user/assistant/system
+                user_msgs = [m for m in msgs if isinstance(m, dict) and (m.get("role") or "").lower() == "user" and m.get("content")]
+                asst_msgs = [m for m in msgs if isinstance(m, dict) and (m.get("role") or "").lower() == "assistant" and m.get("content")]
+                if user_msgs and asst_msgs:
+                    prompt = str(user_msgs[0].get("content", "")).strip()
+                    response = str(asst_msgs[0].get("content", "")).strip()
+                elif asst_msgs and not user_msgs:
+                    # occasionally only assistant content is provided; try to use preceding system prompt if any
+                    sys_msgs = [m for m in msgs if isinstance(m, dict) and (m.get("role") or "").lower() == "system" and m.get("content")]
+                    if sys_msgs:
+                        prompt = str(sys_msgs[0].get("content", "")).strip()
+                        response = str(asst_msgs[0].get("content", "")).strip()
+            except Exception:
+                pass
+
+        # also handle ShareGPT-like key 'conversations'
+        if not prompt and not response:
+            conv = rec.get("conversations")
+            if isinstance(conv, (list, tuple)) and conv:
+                try:
+                    for i, m in enumerate(conv):
+                        role = (m.get("from") or m.get("role") or "").lower()
+                        content = m.get("value") or m.get("content") or ""
+                        if role in ("human", "user") and content:
+                            prompt = str(content).strip()
+                            for j in range(i+1, len(conv)):
+                                mj = conv[j]
+                                rj = (mj.get("from") or mj.get("role") or "").lower()
+                                cj = mj.get("value") or mj.get("content") or ""
+                                if rj in ("gpt", "assistant") and cj:
+                                    response = str(cj).strip()
+                                    break
+                            break
+                except Exception:
+                    pass
+
+        if not prompt:
+            prompt = rec.get("question") or rec.get("instruction") or rec.get("input") or rec.get("prompt") or ""
+        if not response:
+            # combine reasoning/cot with final answer if present
+            reasoning = rec.get("explanation") or rec.get("reasoning") or rec.get("chain_of_thought") or rec.get("cot") or rec.get("thoughts") or ""
+            ans = rec.get("answer") or rec.get("final_answer") or rec.get("output") or rec.get("response") or rec.get("completion") or rec.get("assistant") or ""
+            if reasoning and ans:
+                response = f"{str(reasoning).strip()}\n\nFinal answer: {str(ans).strip()}"
+            else:
+                response = ans or reasoning or ""
+
+        if not prompt or not response:
+            continue
+        out.append({"prompt": str(prompt).strip(), "response": str(response).strip()})
+    return out
+
 # mapping dataset id -> normalizer function and split selection
 NORMALIZERS = {
     "tatsu-lab/alpaca": normalize_alpaca,
@@ -259,7 +353,7 @@ NORMALIZERS = {
     "teknium/OpenHermes-2.5": normalize_openhermes,
     "thoughtsource/thoughtsource": normalize_thoughtsource,
     "open-r1/OpenThoughts-114k": normalize_thoughtsource,
-    "open-thoughts/OpenThoughts-114k": normalize_thoughtsource,
+    "open-thoughts/OpenThoughts-114k": normalize_open_thoughts,
     "gsm8k": normalize_gsm8k,
     "isaiahbjork/chain-of-thought": normalize_generic,
 }
@@ -410,15 +504,14 @@ def format_prompt_response(example):
 def tokenize_and_group(dataset: Dataset, tokenizer: GPT2TokenizerFast, max_length=MAX_SEQ_LENGTH, group_blocks=True):
     print("Tokenizing dataset (this may take some time)...")
 
-    def to_text(ex):
-        return {"text": format_prompt_response(ex)["text"]}
+    # (removed unused single-example mapper; we map in batch below)
 
     # map to text column (batched for efficiency)
     def to_text_batch(batch):
         prompts = batch.get("prompt", [])
         responses = batch.get("response", [])
         texts = [
-            f"User: {str(p).strip()}\nAssistant: {str(r).strip()}"
+            f"User: {str(p).strip()}\nAssistant: {canonicalize_response_text(str(r).strip())}"
             for p, r in zip(prompts, responses)
         ]
         return {"text": texts}

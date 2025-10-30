@@ -116,4 +116,30 @@ ssh -o StrictHostKeyChecking=no -p $SSH_PORT $SSH_USER@$SSH_HOST "
     git clone git@github.com:aemartinez/playground-llm-training.git /workspace/playground-llm-training
 "
 
-echo "Script execution completed. You can connect to the pod with: runpodctl connect $POD_ID"
+# Install a tmuxlog helper script inside the container (system-wide if sudo exists, otherwise per-user)
+ssh -o StrictHostKeyChecking=no -p $SSH_PORT $SSH_USER@$SSH_HOST "
+    if command -v sudo >/dev/null 2>&1; then
+        sudo sh -c 'cat > /usr/local/bin/tmuxlog <<\"EOF\"
+#!/usr/bin/env bash
+tmux new-session -d -s myses \"bash\" \; \\
+  pipe-pane -t myses:0.0 -o \"cat >> \"\$HOME\"/pane.log\" \; \\
+  attach -t myses
+EOF
+chmod +x /usr/local/bin/tmuxlog'
+    else
+        mkdir -p ~/.local/bin
+        cat > ~/.local/bin/tmuxlog <<\"EOF\"
+#!/usr/bin/env bash
+tmux new-session -d -s myses \"bash\" \; \\
+  pipe-pane -t myses:0.0 -o \"cat >> \"\$HOME\"/pane.log\" \; \\
+  attach -t myses
+EOF
+        chmod +x ~/.local/bin/tmuxlog
+        if ! grep -q 'export PATH=\$HOME/.local/bin' ~/.bashrc 2>/dev/null; then
+            echo 'export PATH=\$HOME/.local/bin:\$PATH' >> ~/.bashrc
+        fi
+    fi
+"
+
+echo "Script execution completed. You can connect to the pod with:"
+runpodctl ssh connect $POD_ID
